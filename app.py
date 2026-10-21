@@ -1,9 +1,9 @@
-
 import hashlib
+from datetime import datetime, timezone
 import secrets
+import os
 from pathlib import Path
 from urllib.parse import urlencode
-import os
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -38,14 +38,17 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("Supabase configuration missing in .env")
     st.stop()
 
+UPLOAD_DIR = Path("data/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # --------------------------------------------------
-# 2. Separate Supabase clients per OAuth flow
+# 2. Supabase clients used during OAuth
 # --------------------------------------------------
 
 @st.cache_resource
 def get_client_registry():
-    # Server-side registry. Each random key maps to its own client.
+    # Keeps the OAuth client (and its PKCE verifier) between Streamlit reruns.
     return {}
 
 
@@ -74,7 +77,7 @@ def display_name(pdf_path):
 
 
 # --------------------------------------------------
-# 3. OAuth callback
+# 3. Handle Supabase OAuth callback
 # --------------------------------------------------
 
 auth_session_key = st.query_params.get("auth_session")
@@ -87,26 +90,22 @@ if auth_error:
 
 if auth_code:
     if not auth_session_key:
-        st.error(
-            "OAuth session key missing. Please start a new Google login."
-        )
+        st.error("OAuth session key missing. Please start login again.")
         st.stop()
 
-    registry = get_client_registry()
+    supabase = get_client_registry().get(auth_session_key)
 
-    if auth_session_key not in registry:
+    if supabase is None:
         st.error(
-            "OAuth session expired or unavailable. "
-            "Please restart the app and sign in again."
+            "The OAuth session expired. Restart the app and log in again."
         )
         st.stop()
-
-    supabase = registry[auth_session_key]
 
     try:
-        auth_response = supabase.auth.exchange_code_for_session(
-            {"auth_code": str(auth_code)}
-        )
+        # supabase-py v2 expects the authorization code as a string.
+        auth_response = supabase.auth.exchange_code_for_session({
+            "auth_code": str(auth_code)
+        })
 
         if not auth_response.user or not auth_response.session:
             st.error("Supabase did not return a valid user session.")
@@ -116,16 +115,12 @@ if auth_code:
         st.session_state["supabase_session"] = auth_response.session
         st.session_state["auth_session_key"] = auth_session_key
 
-        # Remove the one-time authorization code only.
-        st.query_params.pop("code", None)
-        st.query_params.pop("error", None)
-        st.query_params.pop("error_description", None)
-
+        st.query_params.clear()
         st.rerun()
 
     except Exception as error:
         st.error(f"Supabase login failed: {error}")
-        st.info("Start a fresh Google login and try again.")
+        st.info("Click Login with Google to start a new login.")
         st.stop()
 
 
@@ -177,7 +172,7 @@ if "supabase_user" not in st.session_state:
 
 
 # --------------------------------------------------
-# 5. Restore the authenticated user's client
+# 5. Restore the authenticated Supabase client
 # --------------------------------------------------
 
 session_key = st.session_state.get("auth_session_key")
@@ -187,22 +182,100 @@ if not session_key:
     st.stop()
 
 registry = get_client_registry()
+supabase = registry.get(session_key)
 
-if session_key not in registry:
+if supabase is None:
     st.error(
         "Authentication client is unavailable. "
-        "Please restart the app and log in again."
+        "Restart the app and log in again."
     )
     st.stop()
-
-supabase = registry[session_key]
 
 user = st.session_state["supabase_user"]
 st.sidebar.success(f"Logged in as {user.email}")
 
 
 # --------------------------------------------------
-# 6. Logout
+# 6. Chat history: one database row per question/answer
+# --------------------------------------------------
+
+def load_chat_history():
+    response = (
+        supabase.table("chat_history")
+        .select("id, question, answer")
+        .eq("user_id", user.id)
+        .order("id")
+        .execute()
+    )
+
+    messages = []
+
+    for row in response.data or []:
+        if row.get("question"):
+            messages.append({
+                "role": "user",
+                "content": row["question"],
+            })
+
+        if row.get("answer"):
+            messages.append({
+                "role": "assistant",
+                "content": row["answer"],
+            })
+
+    return messages
+
+
+def save_chat_exchange(question, answer):
+    supabase.table("chat_history").insert({
+        "user_id": user.id,
+        "question": question,
+        "answer": answer,
+    }).execute()
+
+
+def register_pdf_document(pdf_path, pdf_hash):
+    """Save PDF metadata using the actual pdf_documents table columns."""
+    file_name = display_name(pdf_path)
+    owner_email = user.email
+
+    if not owner_email:
+        raise RuntimeError("The signed-in Supabase user has no email address.")
+
+    # This table contains id, owner_email, file_name, and uploaded_at.
+    # Check first so reruns do not create repeated rows for the same user/file.
+    existing = (
+        supabase.table("pdf_documents")
+        .select("id")
+        .eq("owner_email", owner_email)
+        .eq("file_name", file_name)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        return existing.data[0]
+
+    result = (
+        supabase.table("pdf_documents")
+        .insert({
+            "owner_email": owner_email,
+            "file_name": file_name,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .execute()
+    )
+
+    if not result.data:
+        raise RuntimeError(
+            "Supabase returned no inserted row. Check pdf_documents table permissions (RLS)."
+        )
+
+    return result.data[0]
+
+
+# --------------------------------------------------
+# 7. Logout
 # --------------------------------------------------
 
 if st.sidebar.button("Logout"):
@@ -210,33 +283,30 @@ if st.sidebar.button("Logout"):
         supabase.auth.sign_out()
     except Exception as error:
         st.sidebar.warning(f"Sign-out warning: {error}")
-    finally:
-        registry.pop(session_key, None)
 
-        for key in (
-            "supabase_user",
-            "supabase_session",
-            "auth_session_key",
-            "oauth_url",
-            "oauth_session_key",
-            "messages",
-            "active_pdf",
-        ):
-            st.session_state.pop(key, None)
+    registry.pop(session_key, None)
 
-        st.query_params.clear()
-        st.rerun()
+    for key in (
+        "supabase_user",
+        "supabase_session",
+        "auth_session_key",
+        "oauth_url",
+        "oauth_session_key",
+        "messages",
+        "active_pdf",
+    ):
+        st.session_state.pop(key, None)
+
+    st.query_params.clear()
+    st.rerun()
 
 
 # --------------------------------------------------
-# 7. PDF library
+# 8. PDF library
 # --------------------------------------------------
 
 st.title("📚 Hybrid RAG PDF Assistant")
 st.write("Upload a PDF once, save it, and chat with it anytime.")
-
-UPLOAD_DIR = Path("data/uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 st.subheader("📂 PDF Library")
 
@@ -248,7 +318,7 @@ uploaded_pdf = st.file_uploader(
 
 
 # --------------------------------------------------
-# 8. Save PDF and prevent duplicate uploads
+# 9. Save PDF and prevent duplicate uploads
 # --------------------------------------------------
 
 if uploaded_pdf is not None:
@@ -266,6 +336,11 @@ if uploaded_pdf is not None:
 
     if existing_file:
         st.info("This PDF is already saved in your library.")
+        try:
+            register_pdf_document(existing_file, pdf_hash)
+            st.success("PDF details are synced with Supabase.")
+        except Exception as error:
+            st.error(f"PDF saved locally, but Supabase update failed: {error}")
     else:
         original_name = Path(uploaded_pdf.name).name
 
@@ -275,14 +350,18 @@ if uploaded_pdf is not None:
         )
 
         target = UPLOAD_DIR / f"{pdf_hash[:12]}_{safe_name}"
-        target.write_bytes(pdf_bytes)
 
-        st.success(f"Saved {original_name} successfully!")
-        st.rerun()
+        try:
+            target.write_bytes(pdf_bytes)
+            register_pdf_document(target, pdf_hash)
+            st.success(f"Saved {original_name} and updated Supabase.")
+            st.rerun()
+        except Exception as error:
+            st.error(f"PDF saved locally, but Supabase update failed: {error}")
 
 
 # --------------------------------------------------
-# 9. Select a saved PDF
+# 10. Select a saved PDF
 # --------------------------------------------------
 
 pdf_files = get_saved_pdfs()
@@ -299,7 +378,7 @@ selected_pdf = st.selectbox(
 
 
 # --------------------------------------------------
-# 10. Build and cache the RAG system
+# 11. Build and cache the RAG system
 # --------------------------------------------------
 
 @st.cache_resource(show_spinner=False)
@@ -333,7 +412,7 @@ def load_rag(pdf_path, pdf_hash):
 
 
 # --------------------------------------------------
-# 11. Chat with the selected PDF
+# 12. Chat with the selected PDF
 # --------------------------------------------------
 
 try:
@@ -341,19 +420,30 @@ try:
         selected_pdf.read_bytes()
     ).hexdigest()
 
-    with st.spinner("Preparing your PDF search system..."):
-        hybrid, reranker, generator = load_rag(
-            str(selected_pdf.resolve()),
-            selected_hash,
-        )
+    hybrid, reranker, generator = load_rag(
+        str(selected_pdf.resolve()),
+        selected_hash,
+    )
 
-    st.success(f"Ready to chat with: {display_name(selected_pdf)}")
+    st.success("PDF ready for chatting!")
 
-    if st.session_state.get("active_pdf") != selected_hash:
-        st.session_state["active_pdf"] = selected_hash
+    if "messages" not in st.session_state:
         st.session_state["messages"] = []
 
-    st.session_state.setdefault("messages", [])
+    if "active_pdf" not in st.session_state:
+        st.session_state["active_pdf"] = None
+
+    # Load the signed-in user's saved history when PDF selection changes.
+    # Note: the current table has no PDF identifier, so history is per user,
+    # not separated by PDF.
+    if st.session_state["active_pdf"] != selected_hash:
+        st.session_state["active_pdf"] = selected_hash
+
+        try:
+            st.session_state["messages"] = load_chat_history()
+        except Exception as history_error:
+            st.error(f"Unable to load chat history: {history_error}")
+            st.session_state["messages"] = []
 
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
@@ -368,9 +458,7 @@ try:
                         )
                         st.write(source["text"])
 
-    question = st.chat_input(
-        "Ask a question about your selected PDF..."
-    )
+    question = st.chat_input("Ask a question about your PDF")
 
     if question:
         st.session_state["messages"].append({
@@ -381,20 +469,16 @@ try:
         with st.chat_message("user"):
             st.markdown(question)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Searching and generating answer..."):
-                candidates = hybrid.search(
-                    question,
-                    top_k=10,
-                )
-
-                results = reranker.rerank(
-                    question,
-                    candidates,
-                    top_k=3,
-                )
-
-                answer = generator.generate(question, results)
+        try:
+            with st.chat_message("assistant"):
+                with st.spinner("Searching and generating answer..."):
+                    candidates = hybrid.search(question, top_k=10)
+                    results = reranker.rerank(
+                        question,
+                        candidates,
+                        top_k=3,
+                    )
+                    answer = generator.generate(question, results)
 
                 st.markdown(answer)
 
@@ -407,11 +491,20 @@ try:
                             )
                             st.write(result["text"])
 
-        st.session_state["messages"].append({
-            "role": "assistant",
-            "content": answer,
-            "sources": results,
-        })
+            st.session_state["messages"].append({
+                "role": "assistant",
+                "content": answer,
+                "sources": results,
+            })
+
+            # Save question and answer together in one database row.
+            try:
+                save_chat_exchange(question, answer)
+            except Exception as save_error:
+                st.error(f"Unable to save chat history: {save_error}")
+
+        except Exception as chat_error:
+            st.error(f"Unable to generate the answer: {chat_error}")
 
 except Exception as error:
     st.error(f"Unable to process the PDF: {error}")
