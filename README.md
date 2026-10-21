@@ -15,6 +15,23 @@ A PDF-based question-answering system that combines keyword search, semantic sea
 - Source filename and page references
 - Interactive Streamlit chat interface
 
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    A[PDF Upload] --> B[Text Extraction]
+    B --> C[Text Chunking]
+    C --> D[FAISS Semantic Search]
+    C --> E[BM25 Keyword Search]
+    D --> F[RRF Hybrid Fusion]
+    E --> F
+    F --> G[Cross-Encoder Reranking]
+    G --> H[Groq LLM]
+    H --> I[Answer with Sources]
+```
+
+
 ## Tech Stack
 
 - Python
