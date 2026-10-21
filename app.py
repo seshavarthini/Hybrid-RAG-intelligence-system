@@ -48,8 +48,9 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 @st.cache_resource
 def get_client_registry():
-    # Keeps the OAuth client (and its PKCE verifier) between Streamlit reruns.
-    return {}
+    if "client_registry" not in st.session_state:
+        st.session_state["client_registry"] = {}
+    return st.session_state["client_registry"]
 
 
 def get_supabase_client(session_key):
@@ -62,7 +63,6 @@ def get_supabase_client(session_key):
         )
 
     return registry[session_key]
-
 
 def get_saved_pdfs():
     return sorted(
@@ -138,8 +138,8 @@ if "supabase_user" not in st.session_state:
             supabase = get_supabase_client(session_key)
 
             redirect_url = (
-                "http://localhost:8501/?"
-                + urlencode({"auth_session": session_key})
+            "https://hybrid-rag-intelligence-system-584cf3qwgwhowiewjhv3rm.streamlit.app/?"
+            + urlencode({"auth_session": session_key})
             )
 
             response = supabase.auth.sign_in_with_oauth({
