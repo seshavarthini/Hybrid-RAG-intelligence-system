@@ -64,9 +64,24 @@ def get_supabase_client(session_key):
 
     return registry[session_key]
 
+def get_user_upload_dir():
+    user = st.session_state.get("supabase_user")
+
+    if user is None or not user.id:
+        st.error("Please log in again.")
+        st.stop()
+
+    user_dir = UPLOAD_DIR / str(user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    return user_dir
+
+
 def get_saved_pdfs():
+    user_dir = get_user_upload_dir()
+
     return sorted(
-        UPLOAD_DIR.glob("*.pdf"),
+        user_dir.glob("*.pdf"),
         key=lambda file: file.name.lower(),
     )
 
@@ -349,8 +364,7 @@ if uploaded_pdf is not None:
             for char in original_name
         )
 
-        target = UPLOAD_DIR / f"{pdf_hash[:12]}_{safe_name}"
-
+        target = get_user_upload_dir() / f"{pdf_hash[:12]}_{safe_name}"
         try:
             target.write_bytes(pdf_bytes)
             register_pdf_document(target, pdf_hash)
